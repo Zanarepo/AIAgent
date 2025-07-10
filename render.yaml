@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: sellytics-ai-agent
+    env: python
+    repo: https://github.com/Zanarepo/SellyticsAIAgent
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 4 api:app
+    envVars:
+      - key: SUPABASE_URL
+        value: https://qffcyvjugmtojpdgqriv.supabase.co
+      - key: SUPABASE_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.9.18
