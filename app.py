@@ -3,10 +3,13 @@ from flask_cors import CORS
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import os
+import pandas as pd
+from prophet import Prophet
+from sklearn.ensemble import IsolationForest
+import spacy
+from datetime import datetime, timedelta, timezone
+import numpy as np
 import logging
-import requests
-from datetime import datetime, timezone
-import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -14,190 +17,224 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Adjust origins in production
+CORS(app)  # Enable CORS for React frontend
 
 # Initialize Supabase client
 load_dotenv()
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
-xai_api_key = os.getenv("XAI_API_KEY")
 if not supabase_url or not supabase_key:
     logger.error("Missing SUPABASE_URL or SUPABASE_KEY")
     raise ValueError("Supabase credentials not found")
-if not xai_api_key:
-    logger.error("Missing XAI_API_KEY")
-    raise ValueError("xAI API key not found")
 supabase: Client = create_client(supabase_url, supabase_key)
 
-# FAQ data
-FAQS = [
-    {"question": "How do I begin to use Sellytics?", "answer": "As a new user, register your store with the necessary details to start using Sellytics."},
-    {"question": "How do I add products and prices?", "answer": "Go to Products & Pricing, click 'Add,' and input the product name, description, total purchase price, and quantity purchased."},
-    {"question": "How can I use Sales Tracker?", "answer": "In Sales Tracker, click on Sales to add Product Sold, Quantity, Unit Price, and Payment Method, then click Save Sale."},
-    {"question": "Can I filter or search past sales?", "answer": "Yes, use the built-in search box to find transactions by date, product name, or payment method."},
-    {"question": "What is inventory for?", "answer": "Manage Inventory lets you track items sold and the number of items available."},
-    {"question": "Will I be notified when my stock is running low?", "answer": "Yes, you’ll get automatic alerts when any product hits its minimum stock level, so you never run out unexpectedly."},
-    {"question": "Can I create a receipt for every good sold?", "answer": "Yes, Sellytics generates clean, professional receipts for every item sold, including customer details, which can be printed or emailed."},
-    {"question": "How do I manage returned items or goods?", "answer": "Go to the Returns Tracker, select the items being returned, and capture the goods returned and their details."},
-    {"question": "Can I keep track of my business expenses?", "answer": "Yes, Sellytics allows you to log all expenses like rent and utilities. Click 'Add Expense' and input the details."},
-    {"question": "Can I track customers who owe me money?", "answer": "Yes, the Debt Manager lets you log customers who purchase on credit, tracking who owes what after registering them."},
-    {"question": "How do I manage multiple stores?", "answer": "Create an account for each store. Sellytics links them after verification, allowing you to manage all locations from a centralized dashboard."},
-    {"question": "How do I manage attendants (sellers) working for me?", "answer": "Invite attendants individually and assign them to specific stores. Each attendant manages their account and daily sales within their store."},
-    {"question": "How do I use unpaid supplies?", "answer": "Unpaid Supplies records third-party sellers who take goods to sell and return or pay after sales."},
-    {"question": "How can I see how my business is performing each day?", "answer": "Your dashboard shows a daily summary of total sales, top products, and performance trends at a glance."},
-    {"question": "Can I store my customers’ details?", "answer": "Yes, in the Customer Hub, save names, phone numbers, emails, and addresses to enhance customer service and follow-up."},
-    {"question": "Will I get reports that help me make smarter business decisions?", "answer": "Yes, Sellytics provides insightful reports on sales performance, profit margins, and top-selling items to guide decisions."},
-    {"question": "Can I export or share my reports?", "answer": "Yes, download reports instantly as PDF or CSV files for bookkeeping or sharing with your team."},
-    {"question": "How do I create a receipt for a customer?", "answer": "Go to Quick Receipts, select purchased products, enter quantities, and print or share the receipt instantly."},
-    {"question": "How can I update my product prices?", "answer": "Navigate to Products & Pricing, find the product, click Edit, adjust the price, and click Save."},
-    {"question": "How can I manage unpaid supplier bills?", "answer": "In the Unpaid Supplies section, add the supplier name and owed amount, and update the record when payment is completed."},
-    {"question": "Can I manage more than one store in Sellytics?", "answer": "Yes, in the Multi-Store View, add or select stores to monitor sales, inventory, and staff activity for each location."},
-    {"question": "How do I record business expenses?", "answer": "Open the Expense Log, enter expense details (type, amount, date), categorize it, and click Save to record the transaction."},
-    {"question": "How do I manage customer information?", "answer": "In the Customer Hub, click 'Add New Customer,' enter their details, and update or view their information anytime."},
-    {"question": "Where can I access performance reports?", "answer": "Visit the Reports section to view clear tables showing sales, stock levels, and business trends to support informed decisions."},
-    {"question": "How do I handle product returns?", "answer": "Go to the Returns Tracker, click 'Add Return,' select the item, enter the reason, and confirm. Your inventory will update automatically."},
-]
+# Load NLP model
+nlp = spacy.load("en_core_web_sm")
 
-def process_inquiry(inquiry_text, user_id=None):
+# Sales forecasting with Prophet
+def forecast_demand():
     try:
-        # Fetch user history if user_id is provided
-        history = []
-        if user_id:
-            history_data = supabase.table("chat_history").select("inquiry_text, response_text").eq("user_id", user_id).order("created_at", desc=True).limit(5).execute().data
-            history = [f"User: {h['inquiry_text']}\nBot: {h['response_text']}" for h in history_data]
+        sales = supabase.table("dynamic_sales").select("dynamic_product_id, store_id, quantity, sold_at").execute().data
+        if not sales:
+            logger.info("No sales data found")
+            return []
+        sales_df = pd.DataFrame(sales)
+        sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
+        sales_df["date"] = sales_df["sold_at"].dt.date
 
-        # Prepare the prompt with FAQ context and history
-        faq_context = "\n".join([f"Q: {faq['question']}\nA: {faq['answer']}" for faq in FAQS])
-        history_context = "\n".join(history) if history else "No previous conversation."
-        prompt = (
-            f"You are a helpful assistant for Sellytics, a platform that helps retail stores manage inventory, sales, and customer interactions. "
-            f"Use the following FAQ data to answer the user's inquiry accurately and concisely. If the inquiry is beyond the scope of the FAQs or requires human intervention, respond with: "
-            f"'This query requires assistance from our customer service team. A representative will assist you shortly.' and set the escalation flag. "
-            f"Use the conversation history to provide personalized responses if relevant.\n\n"
-            f"FAQ Data:\n{faq_context}\n\n"
-            f"Conversation History:\n{history_context}\n\n"
-            f"User Inquiry: {inquiry_text}\n\n"
-            f"Provide a clear, professional, and concise response:"
-        )
+        daily_sales = sales_df.groupby(["dynamic_product_id", "store_id", "date"])["quantity"].sum().reset_index()
+        forecasts = []
+        for (product_id, store_id) in daily_sales[["dynamic_product_id", "store_id"]].drop_duplicates().values:
+            product_data = daily_sales[(daily_sales["dynamic_product_id"] == product_id) & (daily_sales["store_id"] == store_id)][["date", "quantity"]]
+            if len(product_data) < 3:
+                continue
 
-        # Call xAI API (Grok 3)
-        headers = {
-            "Authorization": f"Bearer {xai_api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "grok-3",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 150
-        }
-        response = requests.post("https://api.x.ai/v1/chat/completions", headers=headers, json=payload)
-        response.raise_for_status()
-        ai_response = response.json()["choices"][0]["message"]["content"].strip()
+            # Prepare data for Prophet
+            prophet_df = product_data.rename(columns={"date": "ds", "quantity": "y"})
+            model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=True)
+            model.fit(prophet_df)
+            future = model.make_future_dataframe(periods=30)
+            forecast = model.predict(future)
+            predicted_demand = max(0, forecast["yhat"].iloc[-1])
 
-        # Check for escalation
-        escalation_needed = "requires assistance from our customer service team" in ai_response.lower()
-        return ai_response, escalation_needed
+            inventory = supabase.table("dynamic_inventory").select("available_qty, reorder_level, safety_stock").eq("dynamic_product_id", product_id).eq("store_id", store_id).execute().data
+            product = supabase.table("dynamic_product").select("name, purchase_price").eq("id", product_id).execute().data
+            store = supabase.table("stores").select("shop_name").eq("id", store_id).execute().data
+
+            current_stock = int(inventory[0]["available_qty"]) if inventory else 0
+            reorder_level = int(inventory[0]["reorder_level"]) if inventory and inventory[0]["reorder_level"] is not None else 0
+            safety_stock = int(inventory[0]["safety_stock"]) if inventory and inventory[0]["safety_stock"] is not None else 0
+            product_name = product[0]["name"] if product else f"Product ID: {product_id}"
+            purchase_price = float(product[0]["purchase_price"]) if product and product[0]["purchase_price"] is not None else 0.0
+            shop_name = store[0]["shop_name"] if store else f"Store ID: {store_id}"
+
+            restock_qty = max(0, int(predicted_demand + safety_stock - current_stock))
+            recommendation = f"Restock {restock_qty} units" if restock_qty > 0 else "No restock needed"
+
+            forecast = {
+                "dynamic_product_id": int(product_id),
+                "store_id": int(store_id),
+                "predicted_demand": round(float(predicted_demand), 2),
+                "current_stock": current_stock,
+                "restock_quantity": restock_qty,
+                "product_name": product_name,
+                "shop_name": shop_name,
+                "purchase_price": purchase_price,
+                "recommendation": recommendation,
+                "forecast_period": (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m"),
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            forecasts.append(forecast)
+
+        if forecasts:
+            logger.info(f"Inserting {len(forecasts)} forecasts into Supabase")
+            supabase.table("forecasts").insert(forecasts).execute()
+        return forecasts
     except Exception as e:
-        logger.error(f"Error in process_inquiry with AI: {str(e)}")
-        # Fallback response
-        inquiry_text = inquiry_text.lower()
-        responses = {
-            "stock": "Please check the inventory dashboard or contact support for stock details.",
-            "availability": "Availability can be checked in real-time on the platform.",
-            "order": "Orders can be placed through the platform or by contacting support.",
-            "delivery": "Delivery timelines depend on your location. Please provide more details.",
-            "price": "Pricing details are available in the product catalog."
-        }
-        for key, response in responses.items():
-            if key in inquiry_text:
-                return response, False
-        return "Thank you for your inquiry. Please provide more details or contact support.", False
+        logger.error(f"Error in forecast_demand: {str(e)}")
+        raise
 
+# Anomaly detection with Isolation Forest
+def detect_anomalies():
+    try:
+        sales = supabase.table("dynamic_sales").select("id, dynamic_product_id, store_id, quantity, sold_at").execute().data
+        if not sales:
+            logger.info("No sales data found for anomalies")
+            return []
+        sales_df = pd.DataFrame(sales)
+        sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
+
+        anomalies = []
+        for (product_id, store_id) in sales_df[["dynamic_product_id", "store_id"]].drop_duplicates().values:
+            product_sales = sales_df[(sales_df["dynamic_product_id"] == product_id) & (sales_df["store_id"] == store_id)][["quantity", "sold_at"]]
+            if len(product_sales) < 5:
+                continue
+
+            features = product_sales[["quantity"]]
+            iso_forest = IsolationForest(contamination=0.05, random_state=42)
+            product_sales["anomaly"] = iso_forest.fit_predict(features)
+            anomaly_rows = product_sales[product_sales["anomaly"] == -1]
+
+            for _, row in anomaly_rows.iterrows():
+                product = supabase.table("dynamic_product").select("name").eq("id", product_id).execute().data
+                store = supabase.table("stores").select("shop_name").eq("id", store_id).execute().data
+                product_name = product[0]["name"] if product else f"Product ID: {product_id}"
+                shop_name = store[0]["shop_name"] if store else f"Store ID: {store_id}"
+
+                anomalies.append({
+                    "dynamic_product_id": int(product_id),
+                    "store_id": int(store_id),
+                    "quantity": int(row["quantity"]),
+                    "sold_at": row["sold_at"].isoformat(),
+                    "anomaly_type": "Potential theft or error",
+                    "product_name": product_name,
+                    "shop_name": shop_name,
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                })
+
+        if anomalies:
+            logger.info(f"Inserting {len(anomalies)} anomalies into Supabase")
+            supabase.table("anomalies").insert(anomalies).execute()
+        return anomalies
+    except Exception as e:
+        logger.error(f"Error in detect_anomalies: {str(e)}")
+        raise
+
+# Sales trends analysis
+def sales_trends():
+    try:
+        sales = supabase.table("dynamic_sales").select("dynamic_product_id, store_id, quantity, sold_at").execute().data
+        if not sales:
+            logger.info("No sales data found for trends")
+            return {}
+        sales_df = pd.DataFrame(sales)
+        sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
+        sales_df["month"] = sales_df["sold_at"].dt.to_period("M").astype(str)
+
+        product_names = {p["id"]: p["name"] for p in supabase.table("dynamic_product").select("id, name").execute().data}
+        store_names = {s["id"]: s["shop_name"] for s in supabase.table("stores").select("id, shop_name").execute().data}
+
+        trends = {
+            "top_products": sales_df.groupby("dynamic_product_id")["quantity"].sum().nlargest(5).index.map(product_names).to_dict(),
+            "top_stores": sales_df.groupby("store_id")["quantity"].sum().nlargest(5).index.map(store_names).to_dict(),
+            "monthly_trends": sales_df.groupby("month")["quantity"].sum().to_dict(),
+            "product_performance": sales_df.groupby(["dynamic_product_id", "month"])["quantity"].sum().unstack().fillna(0).to_dict()
+        }
+        return trends
+    except Exception as e:
+        logger.error(f"Error in sales_trends: {str(e)}")
+        raise
+
+# Enhanced inquiry processing with NLP
+def process_inquiry(inquiry_text):
+    try:
+        doc = nlp(inquiry_text.lower())
+        intents = {
+            "stock": ["stock", "inventory", "available"],
+            "availability": ["available", "in stock", "stock status"],
+            "order": ["order", "purchase", "buy"],
+            "delivery": ["delivery", "shipping", "arrival"],
+            "price": ["price", "cost", "pricing"]
+        }
+        for intent, keywords in intents.items():
+            if any(token.text in keywords for token in doc):
+                responses = {
+                    "stock": "Check the inventory dashboard for real-time stock levels.",
+                    "availability": "Product availability is updated live on the platform.",
+                    "order": "Place orders directly via the platform or contact support.",
+                    "delivery": "Delivery timelines vary by location. Please provide your details.",
+                    "price": "View pricing in the product catalog on the platform."
+                }
+                return responses[intent]
+        return "Thank you for your inquiry. Please provide more details or contact support."
+    except Exception as e:
+        logger.error(f"Error in process_inquiry: {str(e)}")
+        raise
+
+# Handle customer inquiries
 def handle_inquiries():
     try:
-        inquiries = supabase.table("customer_inquiries").select("id, inquiry_text, user_id").eq("status", "pending").execute().data
+        inquiries = supabase.table("customer_inquiries").select("id, inquiry_text").eq("status", "pending").execute().data
         logger.info(f"Found {len(inquiries)} pending inquiries")
         for inquiry in inquiries:
-            response, escalation_needed = process_inquiry(inquiry["inquiry_text"], inquiry["user_id"])
+            response = process_inquiry(inquiry["inquiry_text"])
             logger.info(f"Processing inquiry {inquiry['id']}: {inquiry['inquiry_text']} -> {response}")
-            
-            # Update customer_inquiries table
             supabase.table("customer_inquiries").update({
                 "response_text": response,
-                "status": "escalated" if escalation_needed else "responded",
-                "updated_at": datetime.now(timezone.utc).isoformat()
+                "status": "responded",
+                "created_at": datetime.now(timezone.utc).isoformat()
             }).eq("id", inquiry["id"]).execute()
-            
-            # Log to chat_history
-            if inquiry["user_id"]:
-                supabase.table("chat_history").insert({
-                    "user_id": inquiry["user_id"],
-                    "inquiry_text": inquiry["inquiry_text"],
-                    "response_text": response,
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }).execute()
-            
-            # Notify customer service for escalated queries
-            if escalation_needed:
-                supabase.table("escalated_queries").insert({
-                    "inquiry_id": inquiry["id"],
-                    "inquiry_text": inquiry["inquiry_text"],
-                    "user_id": inquiry["user_id"],
-                    "status": "pending",
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }).execute()
-        
         return inquiries
     except Exception as e:
         logger.error(f"Error in handle_inquiries: {str(e)}")
         raise
 
-@app.route('/inquiry', methods=['POST'])
-def inquiry_endpoint():
+# API Endpoints
+@app.route('/forecast', methods=['GET'])
+def forecast_endpoint():
     try:
-        data = request.get_json()
-        inquiry_text = data.get("inquiry_text")
-        user_id = data.get("user_id")  # Optional user identifier
-        if not inquiry_text:
-            return jsonify({"error": "Inquiry text is required"}), 400
-        
-        response, escalation_needed = process_inquiry(inquiry_text, user_id)
-        
-        # Store in customer_inquiries
-        inquiry_data = {
-            "inquiry_text": inquiry_text,
-            "response_text": response,
-            "status": "escalated" if escalation_needed else "responded",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }
-        if user_id:
-            inquiry_data["user_id"] = user_id
-        
-        supabase.table("customer_inquiries").insert(inquiry_data).execute()
-        
-        # Store in chat_history if user_id is provided
-        if user_id:
-            supabase.table("chat_history").insert({
-                "user_id": user_id,
-                "inquiry_text": inquiry_text,
-                "response_text": response,
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }).execute()
-        
-        # Notify customer service for escalated queries
-        if escalation_needed:
-            supabase.table("escalated_queries").insert({
-                "inquiry_id": supabase.table("customer_inquiries").select("id").eq("inquiry_text", inquiry_text).order("created_at", desc=True).limit(1).execute().data[0]["id"],
-                "inquiry_text": inquiry_text,
-                "user_id": user_id,
-                "status": "pending",
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }).execute()
-        
-        return jsonify({"response": response}), 200
+        forecasts = forecast_demand()
+        return jsonify({"forecasts": forecasts}), 200
     except Exception as e:
-        logger.error(f"Error in /inquiry: {str(e)}")
+        logger.error(f"Error in /forecast: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/anomalies', methods=['GET'])
+def anomalies_endpoint():
+    try:
+        anomalies = detect_anomalies()
+        return jsonify({"anomalies": anomalies}), 200
+    except Exception as e:
+        logger.error(f"Error in /anomalies: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/trends', methods=['GET'])
+def trends_endpoint():
+    try:
+        trends = sales_trends()
+        return jsonify({"trends": trends}), 200
+    except Exception as e:
+        logger.error(f"Error in /trends: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/inquiries', methods=['GET'])
@@ -211,7 +248,7 @@ def inquiries_endpoint():
 
 @app.route('/', methods=['GET'])
 def root_endpoint():
-    return jsonify({"message": "Sellytics Chatbot AI Agent Backend"}), 200
+    return jsonify({"message": "Sellytics AI Agent Backend"}), 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 5000)))
