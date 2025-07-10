@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sellytics AI Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.20.15/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/axios@1.4.0/dist/axios.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.3.0/dist/chart.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const App = () => {
+      const [forecasts, setForecasts] = useState([]);
+      const [anomalies, setAnomalies] = useState([]);
+      const [trends, setTrends] = useState({});
+      const [inquiries, setInquiries] = useState([]);
+      const [error, setError] = useState(null);
+
+      const fetchData = async () => {
+        try {
+          const [forecastRes, anomaliesRes, trendsRes, inquiriesRes] = await Promise.all([
+            axios.get('http://localhost:5000/forecast'),
+            axios.get('http://localhost:5000/anomalies'),
+            axios.get('http://localhost:5000/trends'),
+            axios.get('http://localhost:5000/inquiries')
+          ]);
+          setForecasts(forecastRes.data.forecasts);
+          setAnomalies(anomaliesRes.data.anomalies);
+          setTrends(trendsRes.data.trends);
+          setInquiries(inquiriesRes.data.inquiries);
+        } catch (err) {
+          setError('Failed to fetch data');
+          console.error(err);
+        }
+      };
+
+      useEffect(() => {
+        fetchData();
+        const interval = setInterval(fetchData, 60000); // Refresh every minute
+        return () => clearInterval(interval);
+      }, []);
+
+      useEffect(() => {
+        if (trends.monthly_trends) {
+          const ctx = document.getElementById('salesChart').getContext('2d');
+          new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: Object.keys(trends.monthly_trends),
+              datasets: [{
+                label: 'Monthly Sales',
+                data: Object.values(trends.monthly_trends),
+                borderColor: 'rgba(75, 192, 192, 1)',
+                fill: false
+              }]
+            },
+            options: { responsive: true }
+          });
+        }
+      }, [trends]);
+
+      return (
+        <div className="container mx-auto p-4">
+          <h1 className="text-3xl font-bold mb-6">Sellytics AI Dashboard</h1>
+          {error && <div className="text-red-500 mb-4">{error}</div>}
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {/* Sales Forecast */}
+            <div className="bg-white p-4 rounded-lg shadow">
+              <h2 className="text-xl font-semibold mb-4">Sales Forecast</h2>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="bg-gray-100">
+                      <th className="p-2">Product</th>
+                      <th className="p-2">Store</th>
+                      <th className="p-2">Demand</th>
+                      <th className="p-2">Stock</th>
+                      <th className="p-2">Restock Cost</th>
+                      <th className="p-2">Recommendation</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {forecasts.map((f, i) => (
+                      <tr key={i} className="border-t">
+                        <td className="p-2">{f.product_name}</td>
+                        <td className="p-2">{f.shop_name}</td>
+                        <td className="p-2">{f.predicted_demand}</td>
+                        <td className="p-2">{f.current_stock}</td>
+                        <td className="p-2">${(f.restock_quantity * f.purchase_price).toFixed(2)}</td>
+                        <td className="p-2 text-blue-600">{f.recommendation}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Anomalies */}
+            <div className="bg-white p-4 rounded-lg shadow">
+              <h2 className="text-xl font-semibold mb-4">Anomalies Detected</h2>
+              <ul className="space-y-2">
+                {anomalies.map((a, i) => (
+                  <li key={i} className="text-sm text-red-600">
+                    {a.anomaly_type} at {a.shop_name} for {a.product_name} (Qty: {a.quantity}, {new Date(a.sold_at).toLocaleString()})
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {/* Sales Trends */}
+            <div className="bg-white p-4 rounded-lg shadow">
+              <h2 className="text-xl font-semibold mb-4">Sales Trends</h2>
+              <canvas id="salesChart" className="w-full h-64"></canvas>
+            </div>
+
+            {/* Inquiries */}
+            <div className="bg-white p-4 rounded-lg shadow">
+              <h2 className="text-xl font-semibold mb-4">Customer Inquiries</h2>
+              <ul className="space-y-2">
+                {inquiries.map((inq, i) => (
+                  <li key={i} className="text-sm">
+                    <strong>Q:</strong> {inq.inquiry_text}<br />
+                    <strong>A:</strong> {inq.response_text || 'Processing...'}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
