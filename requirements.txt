@@ -1,11 +1,12 @@
 flask==2.3.2
 flask-cors==4.0.0
-supabase==2.5.0
+supabase>=2.0.0
 python-dotenv==1.0.0
-pandas==2.2.2
+pandas==2.0.3
 prophet==1.1.5
-scikit-learn==1.5.0
+scikit-learn==1.2.2
 spacy==3.7.4
-numpy==1.26.4
-gunicorn==22.0.0
+numpy==1.24.3
+gunicorn>=20.1.0
 plotly==5.22.0
+python-dotenv==1.0.0
