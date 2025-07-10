@@ -2,10 +2,11 @@ flask==2.3.2
 flask-cors==4.0.0
 supabase>=2.0.0
 python-dotenv>=1.0.0
-pandas==2.0.3  # Use working version
+pandas==2.0.3
 numpy==1.24.3
 scikit-learn==1.2.2
-prophet==1.1.4  # Downgrade for compatibility
-spacy==3.7.2    # Downgrade for compatibility
+prophet==1.1.4
+spacy==3.7.2
 gunicorn>=20.1.0
 plotly==5.22.0
+setuptools>=65.5.0  # Ensure setuptools for source builds
