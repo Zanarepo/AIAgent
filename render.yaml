@@ -4,12 +4,13 @@ services:
     env: python
     repo: https://github.com/Zanarepo/AIAgent.git
     branch: main
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -w 4 api:app
+    pythonVersion: 3.10.12  # Use pythonVersion, not PYTHON_VERSION
+    buildCommand: pip install -r requirements.txt && python -m spacy download en_core_web_sm
+    startCommand: gunicorn -w 4 -b 0.0.0.0:$PORT api:app
     envVars:
       - key: SUPABASE_URL
         value: https://qffcyvjugmtojpdgqriv.supabase.co
       - key: SUPABASE_KEY
-        sync: false
-      - key: PYTHON_VERSION
-        value: 3.9.18
+        sync: false  # Ensure this is set in Render dashboard
+      - key: PORT
+        value: 8000
