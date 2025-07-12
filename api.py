@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from supabase import create_client, Client
@@ -10,9 +11,10 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 import logging
 from functools import lru_cache
+import traceback
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
@@ -24,7 +26,7 @@ CORS(app, resources={r"/*": {
 }})
 logger.info("CORS configured for origins: http://localhost:3000, https://sellytics.sprintifyhq.com")
 
-# Ensure CORS headers for all responses, including errors
+# Ensure CORS headers for all responses
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
@@ -42,7 +44,7 @@ if not supabase_url or not supabase_key:
     raise ValueError("Supabase credentials not found")
 supabase: Client = create_client(supabase_url, supabase_key)
 
-# Helper function to convert NumPy types to Python types
+# Helper function to convert NumPy types
 def convert_to_python_types(obj):
     if isinstance(obj, np.integer):
         return int(obj)
@@ -64,10 +66,10 @@ def fetch_sales_data(store_id=None):
         if store_id:
             query = query.eq("store_id", store_id)
         sales = query.execute().data
-        logger.info(f"Fetched {len(sales)} sales records for store_id {store_id or 'all'}")
+        logger.debug(f"Fetched {len(sales)} sales records for store_id {store_id or 'all'}: {sales}")
         return pd.DataFrame(sales) if sales else pd.DataFrame()
     except Exception as e:
-        logger.error(f"Error fetching sales data: {str(e)}")
+        logger.error(f"Error fetching sales data: {str(e)}\n{traceback.format_exc()}")
         raise
 
 @lru_cache(maxsize=32)
@@ -77,10 +79,10 @@ def fetch_inventory_data(store_id=None):
         if store_id:
             query = query.eq("store_id", store_id)
         inventory = query.execute().data
-        logger.info(f"Fetched {len(inventory)} inventory records for store_id {store_id or 'all'}")
+        logger.debug(f"Fetched {len(inventory)} inventory records for store_id {store_id or 'all'}: {inventory}")
         return pd.DataFrame(inventory) if inventory else pd.DataFrame()
     except Exception as e:
-        logger.error(f"Error fetching inventory data: {str(e)}")
+        logger.error(f"Error fetching inventory data: {str(e)}\n{traceback.format_exc()}")
         raise
 
 # Sales forecasting with Prophet
@@ -92,34 +94,39 @@ def forecast_demand(store_id=None):
             return []
         sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
         sales_df["month"] = sales_df["sold_at"].dt.to_period("M").dt.to_timestamp()
+        logger.debug(f"Sales data shape: {sales_df.shape}, columns: {sales_df.columns}")
 
         forecasts = []
         for (product_id, store_id) in sales_df[["dynamic_product_id", "store_id"]].drop_duplicates().values:
             product_data = sales_df[(sales_df["dynamic_product_id"] == product_id) & (sales_df["store_id"] == store_id)]
             monthly_sales = product_data.groupby("month")["quantity"].sum().reset_index()
             monthly_sales.columns = ["ds", "y"]
+            logger.debug(f"Monthly sales for product_id {product_id}, store_id {store_id}: {monthly_sales}")
 
             if len(monthly_sales) < 2:
                 logger.info(f"Skipping forecast for product_id {product_id}, store_id {store_id}: insufficient data")
                 continue
 
             model = Prophet(
-                yearly_seasonality=False,  # Disable to avoid holidays
+                yearly_seasonality=False,
                 weekly_seasonality=False,
                 daily_seasonality=False,
-                holidays=None,  # Explicitly disable holidays
-                changepoint_prior_scale=0.05,
-                seasonality_prior_scale=10.0
+                holidays=None,
+                changepoint_prior_scale=0.01,
+                seasonality_prior_scale=5.0
             )
             model.fit(monthly_sales)
             future = model.make_future_dataframe(periods=1, freq="M")
             forecast = model.predict(future)
             predicted_demand = max(0, forecast["yhat"].iloc[-1])
+            logger.debug(f"Predicted demand for product_id {product_id}, store_id {store_id}: {predicted_demand}")
 
             inventory = fetch_inventory_data(store_id)
             inventory = inventory[(inventory["dynamic_product_id"] == product_id) & (inventory["store_id"] == store_id)]
             product = supabase.table("dynamic_product").select("name").eq("id", product_id).execute().data
             store = supabase.table("stores").select("shop_name").eq("id", store_id).execute().data
+            logger.debug(f"Inventory data: {inventory.to_dict() if not inventory.empty else 'empty'}")
+            logger.debug(f"Product data: {product}, Store data: {store}")
 
             if inventory.empty:
                 logger.warning(f"No inventory data for product_id {product_id}, store_id {store_id}")
@@ -152,7 +159,7 @@ def forecast_demand(store_id=None):
             supabase.table("forecasts").insert(forecasts).execute()
         return forecasts
     except Exception as e:
-        logger.error(f"Error in forecast_demand: {str(e)}")
+        logger.error(f"Error in forecast_demand: {str(e)}\n{traceback.format_exc()}")
         raise
 
 # Theft detection
@@ -207,7 +214,7 @@ def detect_theft(store_id=None):
             supabase.table("theft_incidents").insert(theft_incidents).execute()
         return theft_incidents
     except Exception as e:
-        logger.error(f"Error in detect_theft: {str(e)}")
+        logger.error(f"Error in detect_theft: {str(e)}\n{traceback.format_exc()}")
         raise
 
 # Anomaly detection
@@ -218,18 +225,25 @@ def detect_anomalies(store_id=None):
             logger.info("No sales data found for anomalies")
             return []
         sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
+        logger.debug(f"Anomaly detection - Sales data shape: {sales_df.shape}, unique products: {len(sales_df['dynamic_product_id'].unique())}")
 
         anomalies = []
-        iso_forest = IsolationForest(contamination=0.1, random_state=42)
+        iso_forest = IsolationForest(n_estimators=50, max_samples=256, contamination=0.1, random_state=42, n_jobs=1)
         for (product_id, store_id) in sales_df[["dynamic_product_id", "store_id"]].drop_duplicates().values:
             product_data = sales_df[(sales_df["dynamic_product_id"] == product_id) & (sales_df["store_id"] == store_id)]
+            logger.debug(f"Processing anomaly detection for product_id {product_id}, store_id {store_id}, data size: {len(product_data)}")
             if len(product_data) < 3:
                 logger.info(f"Skipping anomaly detection for product_id {product_id}, store_id {store_id}: insufficient data")
                 continue
 
             product_data = product_data.copy()
-            product_data["anomaly"] = iso_forest.fit_predict(product_data[["quantity"]])
-            anomaly_rows = product_data[product_data["anomaly"] == -1].index
+            try:
+                product_data["anomaly"] = iso_forest.fit_predict(product_data[["quantity"]])
+                anomaly_rows = product_data[product_data["anomaly"] == -1].index
+                logger.debug(f"Found {len(anomaly_rows)} anomalies for product_id {product_id}, store_id {store_id}")
+            except Exception as e:
+                logger.error(f"Error in IsolationForest for product_id {product_id}, store_id {store_id}: {str(e)}\n{traceback.format_exc()}")
+                continue
 
             for idx in anomaly_rows:
                 row = product_data.loc[idx]
@@ -244,7 +258,7 @@ def detect_anomalies(store_id=None):
                     "store_id": int(row["store_id"]),
                     "quantity": int(row["quantity"]),
                     "sold_at": row["sold_at"].isoformat(),
-                    "anomaly_type": "Outlier",
+                    "anomaly_type": "High" if row["quantity"] > product_data["quantity"].mean() else "Low",
                     "created_at": datetime.now(timezone.utc).isoformat()
                 })
 
@@ -253,7 +267,7 @@ def detect_anomalies(store_id=None):
             supabase.table("anomalies").insert(anomalies).execute()
         return anomalies
     except Exception as e:
-        logger.error(f"Error in detect_anomalies: {str(e)}")
+        logger.error(f"Error in detect_anomalies: {str(e)}\n{traceback.format_exc()}")
         raise
 
 # Sales trends
@@ -278,12 +292,11 @@ def sales_trends(store_id=None):
             "monthly_trends": sales_df.groupby("month")["quantity"].sum().to_dict(),
             "yearly_growth": sales_df.groupby("year")["quantity"].sum().pct_change().fillna(0).to_dict()
         }
-        # Convert NumPy types to Python types
         trends = convert_to_python_types(trends)
-        logger.info(f"Generated trends for store_id {store_id or 'all'}: {trends}")
+        logger.debug(f"Generated trends for store_id {store_id or 'all'}: {trends}")
         return trends
     except Exception as e:
-        logger.error(f"Error in sales_trends: {str(e)}")
+        logger.error(f"Error in sales_trends: {str(e)}\n{traceback.format_exc()}")
         raise
 
 # Inquiry processing
@@ -303,13 +316,13 @@ def process_inquiry(inquiry_text):
                 return response
         return "Thanks for your inquiry. Please provide more details or contact support."
     except Exception as e:
-        logger.error(f"Error in process_inquiry: {str(e)}")
+        logger.error(f"Error in process_inquiry: {str(e)}\n{traceback.format_exc()}")
         raise
 
 def handle_inquiries():
     try:
         inquiries = supabase.table("customer_inquiries").select("id, inquiry_text").eq("status", "pending").execute().data
-        logger.info(f"Found {len(inquiries)} pending inquiries")
+        logger.debug(f"Found {len(inquiries)} pending inquiries: {inquiries}")
         processed = []
         for inquiry in inquiries:
             response = process_inquiry(inquiry["inquiry_text"])
@@ -321,9 +334,10 @@ def handle_inquiries():
             processed.append({"inquiry_text": inquiry["inquiry_text"], "response_text": response})
         
         recent_inquiries = supabase.table("customer_inquiries").select("inquiry_text, response_text").order("created_at", desc=True).limit(10).execute().data
+        logger.debug(f"Recent inquiries: {recent_inquiries}")
         return recent_inquiries
     except Exception as e:
-        logger.error(f"Error in handle_inquiries: {str(e)}")
+        logger.error(f"Error in handle_inquiries: {str(e)}\n{traceback.format_exc()}")
         raise
 
 @app.route('/forecast', methods=['GET'])
@@ -333,31 +347,36 @@ def forecast_endpoint():
         if store_id:
             try:
                 store_id = int(store_id)
+                logger.debug(f"Processing forecast for store_id: {store_id}")
             except ValueError:
+                logger.error("Invalid store_id format")
                 return jsonify({"error": "Invalid store_id format"}), 400
 
         forecasts = forecast_demand(store_id)
         anomalies = detect_anomalies(store_id)
         theft_incidents = detect_theft(store_id)
         trends = sales_trends(store_id)
-        return jsonify({
+        response = {
             "forecasts": forecasts,
             "anomalies": anomalies,
             "theft_incidents": theft_incidents,
             "trends": trends
-        }), 200
+        }
+        logger.debug(f"Forecast endpoint response: {response}")
+        return jsonify(response), 200
     except Exception as e:
-        logger.error(f"Error in /forecast: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error in /forecast: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
 
 @app.route('/inquiries', methods=['GET'])
 def inquiries_endpoint():
     try:
         inquiries = handle_inquiries()
+        logger.debug(f"Inquiries endpoint response: {inquiries}")
         return jsonify({"inquiries": inquiries}), 200
     except Exception as e:
-        logger.error(f"Error in /inquiries: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error in /inquiries: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
 
 @app.route('/theft', methods=['GET'])
 def theft_endpoint():
@@ -366,17 +385,21 @@ def theft_endpoint():
         if store_id:
             try:
                 store_id = int(store_id)
+                logger.debug(f"Processing theft for store_id: {store_id}")
             except ValueError:
+                logger.error("Invalid store_id format")
                 return jsonify({"error": "Invalid store_id format"}), 400
         theft_incidents = detect_theft(store_id)
+        logger.debug(f"Theft endpoint response: {theft_incidents}")
         return jsonify({"theft_incidents": theft_incidents}), 200
     except Exception as e:
-        logger.error(f"Error in /theft: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error in /theft: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
 
 @app.route('/', methods=['GET'])
 def root_endpoint():
+    logger.info("Root endpoint accessed")
     return jsonify({"message": "Sellytics AI Agent Backend"}), 200
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 5000)))
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8000)))
