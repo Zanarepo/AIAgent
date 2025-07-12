@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
 import os
 import pandas as pd
 from prophet import Prophet
@@ -11,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 import logging
 from functools import lru_cache
 import traceback
+import atexit
+import json
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -61,11 +64,11 @@ def convert_to_python_types(obj):
 @lru_cache(maxsize=32)
 def fetch_sales_data(store_id=None):
     try:
-        query = supabase.table("dynamic_sales").select("dynamic_product_id, store_id, quantity, sold_at")
+        query = supabase.table("dynamic_sales").select("dynamic_product_id, store_id, quantity, sold_at").limit(500)
         if store_id:
             query = query.eq("store_id", store_id)
         sales = query.execute().data
-        logger.debug(f"Fetched {len(sales)} sales records for store_id {store_id or 'all'}: {sales}")
+        logger.debug(f"Fetched {len(sales)} sales records for store_id {store_id or 'all'}")
         return pd.DataFrame(sales) if sales else pd.DataFrame()
     except Exception as e:
         logger.error(f"Error fetching sales data: {str(e)}\n{traceback.format_exc()}")
@@ -74,88 +77,118 @@ def fetch_sales_data(store_id=None):
 @lru_cache(maxsize=32)
 def fetch_inventory_data(store_id=None):
     try:
-        query = supabase.table("dynamic_inventory").select("dynamic_product_id, store_id, available_qty, reorder_level, safety_stock, updated_at")
+        query = supabase.table("dynamic_inventory").select("dynamic_product_id, store_id, available_qty, reorder_level, safety_stock, updated_at").limit(500)
         if store_id:
             query = query.eq("store_id", store_id)
         inventory = query.execute().data
-        logger.debug(f"Fetched {len(inventory)} inventory records for store_id {store_id or 'all'}: {inventory}")
+        logger.debug(f"Fetched {len(inventory)} inventory records for store_id {store_id or 'all'}")
         return pd.DataFrame(inventory) if inventory else pd.DataFrame()
     except Exception as e:
         logger.error(f"Error fetching inventory data: {str(e)}\n{traceback.format_exc()}")
         raise
 
+@lru_cache(maxsize=32)
+def fetch_store_ids():
+    try:
+        stores = supabase.table("stores").select("id").execute().data
+        store_ids = [store["id"] for store in stores]
+        logger.debug(f"Fetched {len(store_ids)} store IDs: {store_ids}")
+        return store_ids
+    except Exception as e:
+        logger.error(f"Error fetching store IDs: {str(e)}\n{traceback.format_exc()}")
+        raise
+
 # Sales forecasting with Prophet
 def forecast_demand(store_id=None):
     try:
-        sales_df = fetch_sales_data(store_id)
-        if sales_df.empty:
-            logger.info("No sales data found")
+        store_ids = [store_id] if store_id else fetch_store_ids()
+        if not store_ids:
+            logger.info("No stores found for forecasting")
             return []
-        sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
-        sales_df["month"] = sales_df["sold_at"].dt.to_period("M").dt.to_timestamp()
-        logger.debug(f"Sales data shape: {sales_df.shape}, columns: {sales_df.columns}")
 
         forecasts = []
-        for (product_id, store_id) in sales_df[["dynamic_product_id", "store_id"]].drop_duplicates().values:
-            product_data = sales_df[(sales_df["dynamic_product_id"] == product_id) & (sales_df["store_id"] == store_id)]
-            monthly_sales = product_data.groupby("month")["quantity"].sum().reset_index()
-            monthly_sales.columns = ["ds", "y"]
-            logger.debug(f"Monthly sales for product_id {product_id}, store_id {store_id}: {monthly_sales}")
-
-            if len(monthly_sales) < 2:
-                logger.info(f"Skipping forecast for product_id {product_id}, store_id {store_id}: insufficient data")
+        for sid in store_ids:
+            sales_df = fetch_sales_data(sid)
+            if sales_df.empty:
+                logger.info(f"No sales data found for store_id {sid}")
                 continue
+            sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
+            sales_df["month"] = sales_df["sold_at"].dt.to_period("M").dt.to_timestamp()
+            logger.debug(f"Sales data shape for store_id {sid}: {sales_df.shape}, columns: {sales_df.columns}")
 
-            model = Prophet(
-                yearly_seasonality=False,
-                weekly_seasonality=False,
-                daily_seasonality=False,
-                holidays=None,
-                changepoint_prior_scale=0.01,
-                seasonality_prior_scale=5.0
-            )
-            model.fit(monthly_sales)
-            future = model.make_future_dataframe(periods=1, freq="M")
-            forecast = model.predict(future)
-            predicted_demand = max(0, forecast["yhat"].iloc[-1])
-            logger.debug(f"Predicted demand for product_id {product_id}, store_id {store_id}: {predicted_demand}")
+            # Log unique product-store pairs and their month counts
+            product_store_groups = sales_df.groupby(["dynamic_product_id", "store_id"])["month"].nunique().reset_index()
+            logger.debug(f"Product-store pairs with month counts for store_id {sid}: {product_store_groups.to_dict()}")
 
-            inventory = fetch_inventory_data(store_id)
-            inventory = inventory[(inventory["dynamic_product_id"] == product_id) & (inventory["store_id"] == store_id)]
-            product = supabase.table("dynamic_product").select("name").eq("id", product_id).execute().data
-            store = supabase.table("stores").select("shop_name").eq("id", store_id).execute().data
-            logger.debug(f"Inventory data: {inventory.to_dict() if not inventory.empty else 'empty'}")
-            logger.debug(f"Product data: {product}, Store data: {store}")
+            for (product_id, store_id) in sales_df[["dynamic_product_id", "store_id"]].drop_duplicates().values:
+                product_data = sales_df[(sales_df["dynamic_product_id"] == product_id) & (sales_df["store_id"] == store_id)]
+                monthly_sales = product_data.groupby("month")["quantity"].sum().reset_index()
+                monthly_sales.columns = ["ds", "y"]
+                logger.debug(f"Monthly sales for product_id {product_id}, store_id {store_id}: {monthly_sales}")
 
-            if inventory.empty:
-                logger.warning(f"No inventory data for product_id {product_id}, store_id {store_id}")
-                current_stock = 0
-                reorder_level = 0
-            else:
-                current_stock = int(inventory["available_qty"].iloc[-1])
-                reorder_level = int(inventory["reorder_level"].iloc[-1]) if inventory["reorder_level"].iloc[-1] is not None else 0
+                if len(monthly_sales) < 2:
+                    logger.info(f"Skipping forecast for product_id {product_id}, store_id {store_id}: insufficient data ({len(monthly_sales)} months)")
+                    continue
 
-            product_name = product[0]["name"] if product and len(product) > 0 else f"Product ID: {product_id}"
-            shop_name = store[0]["shop_name"] if store and len(store) > 0 else f"Store ID: {store_id}"
+                model = Prophet(
+                    yearly_seasonality=False,
+                    weekly_seasonality=False,
+                    daily_seasonality=False,
+                    holidays=None,
+                    changepoint_prior_scale=0.01,
+                    seasonality_prior_scale=5.0
+                )
+                try:
+                    model.fit(monthly_sales)
+                    future = model.make_future_dataframe(periods=1, freq="M")
+                    forecast = model.predict(future)
+                    predicted_demand = max(0, forecast["yhat"].iloc[-1])
+                    logger.debug(f"Predicted demand for product_id {product_id}, store_id {store_id}: {predicted_demand}")
+                except Exception as e:
+                    logger.error(f"Error in Prophet forecast for product_id {product_id}, store_id {store_id}: {str(e)}\n{traceback.format_exc()}")
+                    continue
 
-            recommendation = "Restock recommended" if predicted_demand > current_stock + reorder_level else "No restock needed"
+                inventory = fetch_inventory_data(store_id)
+                inventory = inventory[(inventory["dynamic_product_id"] == product_id) & (inventory["store_id"] == store_id)]
+                product = supabase.table("dynamic_product").select("name").eq("id", product_id).execute().data
+                store = supabase.table("stores").select("shop_name").eq("id", store_id).execute().data
+                logger.debug(f"Inventory data: {inventory.to_dict() if not inventory.empty else 'empty'}")
+                logger.debug(f"Product data: {product}, Store data: {store}")
 
-            forecast_entry = {
-                "dynamic_product_id": int(product_id),
-                "store_id": int(store_id),
-                "predicted_demand": round(float(predicted_demand), 2),
-                "current_stock": current_stock,
-                "product_name": product_name,
-                "shop_name": shop_name,
-                "recommendation": recommendation,
-                "forecast_period": (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m"),
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }
-            forecasts.append(forecast_entry)
+                if inventory.empty:
+                    logger.warning(f"No inventory data for product_id {product_id}, store_id {store_id}")
+                    current_stock = 0
+                    reorder_level = 0
+                else:
+                    current_stock = int(inventory["available_qty"].iloc[-1])
+                    reorder_level = int(inventory["reorder_level"].iloc[-1]) if inventory["reorder_level"].iloc[-1] is not None else 0
+
+                product_name = product[0]["name"] if product and len(product) > 0 else f"Product ID: {product_id}"
+                shop_name = store[0]["shop_name"] if store and len(store) > 0 else f"Store ID: {store_id}"
+
+                recommendation = "Restock recommended" if predicted_demand > current_stock + reorder_level else "No restock needed"
+
+                forecast_entry = {
+                    "dynamic_product_id": int(product_id),
+                    "store_id": int(store_id),
+                    "predicted_demand": round(float(predicted_demand), 2),
+                    "current_stock": current_stock,
+                    "product_name": product_name,
+                    "shop_name": shop_name,
+                    "recommendation": recommendation,
+                    "forecast_period": (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m"),
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
+                forecasts.append(forecast_entry)
 
         if forecasts:
-            logger.info(f"Inserting {len(forecasts)} forecasts into Supabase")
-            supabase.table("forecasts").insert(forecasts).execute()
+            try:
+                logger.info(f"Inserting {len(forecasts)} forecasts into Supabase: {forecasts}")
+                supabase.table("forecast").insert(forecasts).execute()
+            except Exception as e:
+                logger.error(f"Failed to insert forecast records: {str(e)}\n{traceback.format_exc()}")
+        else:
+            logger.warning(f"No forecasts generated for store_id {store_id or 'all'}; check data sufficiency")
         return forecasts
     except Exception as e:
         logger.error(f"Error in forecast_demand: {str(e)}\n{traceback.format_exc()}")
@@ -164,53 +197,62 @@ def forecast_demand(store_id=None):
 # Theft detection
 def detect_theft(store_id=None):
     try:
-        sales_df = fetch_sales_data(store_id)
-        inventory_df = fetch_inventory_data(store_id)
-        if sales_df.empty or inventory_df.empty:
-            logger.info("No sales or inventory data for theft detection")
+        store_ids = [store_id] if store_id else fetch_store_ids()
+        if not store_ids:
+            logger.info("No stores found for theft detection")
             return []
 
-        sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
-        inventory_df["updated_at"] = pd.to_datetime(inventory_df["updated_at"], utc=True)
-
         theft_incidents = []
-        for (product_id, store_id) in inventory_df[["dynamic_product_id", "store_id"]].drop_duplicates().values:
-            product_sales = sales_df[(sales_df["dynamic_product_id"] == product_id) & (sales_df["store_id"] == store_id)]
-            product_inventory = inventory_df[(inventory_df["dynamic_product_id"] == product_id) & (inventory_df["store_id"] == store_id)]
-
-            if product_inventory.empty or len(product_inventory) < 2:
-                logger.info(f"Skipping theft detection for product_id {product_id}, store_id {store_id}: insufficient inventory data")
+        for sid in store_ids:
+            sales_df = fetch_sales_data(sid)
+            inventory_df = fetch_inventory_data(sid)
+            if sales_df.empty or inventory_df.empty:
+                logger.info(f"No sales or inventory data for store_id {sid}")
                 continue
 
-            product_inventory = product_inventory.sort_values("updated_at")
-            inventory_changes = product_inventory["available_qty"].diff().dropna()
+            sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
+            inventory_df["updated_at"] = pd.to_datetime(inventory_df["updated_at"], utc=True)
 
-            sales_period = product_sales[(product_sales["sold_at"] >= product_inventory["updated_at"].min()) & 
-                                        (product_sales["sold_at"] <= product_inventory["updated_at"].max())]
-            total_sold = sales_period["quantity"].sum()
+            for (product_id, store_id) in inventory_df[["dynamic_product_id", "store_id"]].drop_duplicates().values:
+                product_sales = sales_df[(sales_df["dynamic_product_id"] == product_id) & (sales_df["store_id"] == store_id)]
+                product_inventory = inventory_df[(inventory_df["dynamic_product_id"] == product_id) & (inventory_df["store_id"] == store_id)]
 
-            for idx, change in inventory_changes.items():
-                if change < 0:
-                    expected_change = -total_sold
-                    if abs(change) > abs(expected_change) * 1.2:
-                        product = supabase.table("dynamic_product").select("name").eq("id", product_id).execute().data
-                        store = supabase.table("stores").select("shop_name").eq("id", store_id).execute().data
-                        product_name = product[0]["name"] if product and len(product) > 0 else f"Product ID: {product_id}"
-                        shop_name = store[0]["shop_name"] if store and len(store) > 0 else f"Store ID: {store_id}"
-                        theft_incidents.append({
-                            "dynamic_product_id": int(product_id),
-                            "store_id": int(store_id),
-                            "inventory_change": float(change),
-                            "expected_change": float(expected_change),
-                            "timestamp": product_inventory.loc[idx, "updated_at"].isoformat(),
-                            "product_name": product_name,
-                            "shop_name": shop_name,
-                            "created_at": datetime.now(timezone.utc).isoformat()
-                        })
+                if product_inventory.empty or len(product_inventory) < 2:
+                    logger.info(f"Skipping theft detection for product_id {product_id}, store_id {store_id}: insufficient data")
+                    continue
+
+                product_inventory = product_inventory.sort_values("updated_at")
+                inventory_changes = product_inventory["available_qty"].diff().dropna()
+
+                sales_period = product_sales[(product_sales["sold_at"] >= product_inventory["updated_at"].min()) & 
+                                            (product_sales["sold_at"] <= product_inventory["updated_at"].max())]
+                total_sold = sales_period["quantity"].sum()
+
+                for idx, change in inventory_changes.items():
+                    if change < 0:
+                        expected_change = -total_sold
+                        if abs(change) > abs(expected_change) * 1.2:
+                            product = supabase.table("dynamic_product").select("name").eq("id", product_id).execute().data
+                            store = supabase.table("stores").select("shop_name").eq("id", store_id).execute().data
+                            product_name = product[0]["name"] if product and len(product) > 0 else f"Product ID: {product_id}"
+                            shop_name = store[0]["shop_name"] if store and len(store) > 0 else f"Store ID: {store_id}"
+                            theft_incidents.append({
+                                "dynamic_product_id": int(product_id),
+                                "store_id": int(store_id),
+                                "inventory_change": float(change),
+                                "expected_change": float(expected_change),
+                                "timestamp": product_inventory.loc[idx, "updated_at"].isoformat(),
+                                "product_name": product_name,
+                                "shop_name": shop_name,
+                                "created_at": datetime.now(timezone.utc).isoformat()
+                            })
 
         if theft_incidents:
-            logger.info(f"Inserting {len(theft_incidents)} theft incidents into Supabase")
-            supabase.table("theft_incidents").insert(theft_incidents).execute()
+            try:
+                logger.info(f"Inserting {len(theft_incidents)} theft incidents into Supabase")
+                supabase.table("theft_incidents").insert(theft_incidents).execute()
+            except Exception as e:
+                logger.error(f"Failed to insert theft incidents: {str(e)}\n{traceback.format_exc()}")
         return theft_incidents
     except Exception as e:
         logger.error(f"Error in detect_theft: {str(e)}\n{traceback.format_exc()}")
@@ -219,51 +261,60 @@ def detect_theft(store_id=None):
 # Anomaly detection (kept for reference, not called in forecast_endpoint)
 def detect_anomalies(store_id=None):
     try:
-        sales_df = fetch_sales_data(store_id)
-        if sales_df.empty:
-            logger.info("No sales data found for anomalies")
+        store_ids = [store_id] if store_id else fetch_store_ids()
+        if not store_ids:
+            logger.info("No stores found for anomaly detection")
             return []
-        sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
-        logger.debug(f"Anomaly detection - Sales data shape: {sales_df.shape}, unique products: {len(sales_df['dynamic_product_id'].unique())}")
 
         anomalies = []
-        iso_forest = IsolationForest(n_estimators=50, max_samples=256, contamination=0.1, random_state=42, n_jobs=1)
-        for (product_id, store_id) in sales_df[["dynamic_product_id", "store_id"]].drop_duplicates().values:
-            product_data = sales_df[(sales_df["dynamic_product_id"] == product_id) & (sales_df["store_id"] == store_id)]
-            logger.debug(f"Processing anomaly detection for product_id {product_id}, store_id {store_id}, data size: {len(product_data)}")
-            if len(product_data) < 3:
-                logger.info(f"Skipping anomaly detection for product_id {product_id}, store_id {store_id}: insufficient data")
+        for sid in store_ids:
+            sales_df = fetch_sales_data(sid)
+            if sales_df.empty:
+                logger.info(f"No sales data found for store_id {sid}")
                 continue
+            sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
+            logger.debug(f"Anomaly detection - Sales data shape for store_id {sid}: {sales_df.shape}")
 
-            product_data = product_data.copy()
-            try:
-                product_data["anomaly"] = iso_forest.fit_predict(product_data[["quantity"]])
-                anomaly_rows = product_data[product_data["anomaly"] == -1].index
-                logger.debug(f"Found {len(anomaly_rows)} anomalies for product_id {product_id}, store_id {store_id}")
-            except Exception as e:
-                logger.error(f"Error in IsolationForest for product_id {product_id}, store_id {store_id}: {str(e)}\n{traceback.format_exc()}")
-                continue
+            for (product_id, store_id) in sales_df[["dynamic_product_id", "store_id"]].drop_duplicates().values:
+                product_data = sales_df[(sales_df["dynamic_product_id"] == product_id) & (sales_df["store_id"] == store_id)]
+                logger.debug(f"Processing anomaly detection for product_id {product_id}, store_id {store_id}, data size: {len(product_data)}")
+                if len(product_data) < 3:
+                    logger.info(f"Skipping anomaly detection for product_id {product_id}, store_id {store_id}: insufficient data")
+                    continue
 
-            for idx in anomaly_rows:
-                row = product_data.loc[idx]
-                product = supabase.table("dynamic_product").select("name").eq("id", product_id).execute().data
-                store = supabase.table("stores").select("shop_name").eq("id", store_id).execute().data
-                if not product:
-                    logger.warning(f"No product found for product_id {product_id}")
-                if not store:
-                    logger.warning(f"No store found for store_id {store_id}")
-                anomalies.append({
-                    "dynamic_product_id": int(row["dynamic_product_id"]),
-                    "store_id": int(row["store_id"]),
-                    "quantity": int(row["quantity"]),
-                    "sold_at": row["sold_at"].isoformat(),
-                    "anomaly_type": "High" if row["quantity"] > product_data["quantity"].mean() else "Low",
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                })
+                product_data = product_data.copy()
+                try:
+                    iso_forest = IsolationForest(n_estimators=50, max_samples=256, contamination=0.1, random_state=42, n_jobs=1)
+                    product_data["anomaly"] = iso_forest.fit_predict(product_data[["quantity"]])
+                    anomaly_rows = product_data[product_data["anomaly"] == -1].index
+                    logger.debug(f"Found {len(anomaly_rows)} anomalies for product_id {product_id}, store_id {store_id}")
+                except Exception as e:
+                    logger.error(f"Error in IsolationForest for product_id {product_id}, store_id {store_id}: {str(e)}\n{traceback.format_exc()}")
+                    continue
+
+                for idx in anomaly_rows:
+                    row = product_data.loc[idx]
+                    product = supabase.table("dynamic_product").select("name").eq("id", product_id).execute().data
+                    store = supabase.table("stores").select("shop_name").eq("id", store_id).execute().data
+                    if not product:
+                        logger.warning(f"No product found for product_id {product_id}")
+                    if not store:
+                        logger.warning(f"No store found for store_id {store_id}")
+                    anomalies.append({
+                        "dynamic_product_id": int(row["dynamic_product_id"]),
+                        "store_id": int(row["store_id"]),
+                        "quantity": int(row["quantity"]),
+                        "sold_at": row["sold_at"].isoformat(),
+                        "anomaly_type": "High" if row["quantity"] > product_data["quantity"].mean() else "Low",
+                        "created_at": datetime.now(timezone.utc).isoformat()
+                    })
 
         if anomalies:
-            logger.info(f"Inserting {len(anomalies)} anomalies into Supabase")
-            supabase.table("anomalies").insert(anomalies).execute()
+            try:
+                logger.info(f"Inserting {len(anomalies)} anomalies into Supabase")
+                supabase.table("anomalies").insert(anomalies).execute()
+            except Exception as e:
+                logger.error(f"Failed to insert anomalies: {str(e)}\n{traceback.format_exc()}")
         return anomalies
     except Exception as e:
         logger.error(f"Error in detect_anomalies: {str(e)}\n{traceback.format_exc()}")
@@ -272,31 +323,90 @@ def detect_anomalies(store_id=None):
 # Sales trends
 def sales_trends(store_id=None):
     try:
-        sales_df = fetch_sales_data(store_id)
-        if sales_df.empty:
-            logger.info(f"No sales data found for store_id {store_id or 'all'}")
+        store_ids = [store_id] if store_id else fetch_store_ids()
+        if not store_ids:
+            logger.info("No stores found for sales trends")
             return {
                 "top_products": {},
-                "top_stores": {},
                 "monthly_trends": {},
-                "yearly_growth": {}
+                "monthly_growth": {}
             }
-        sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
-        sales_df["month"] = sales_df["sold_at"].dt.to_period("M").astype(str)
-        sales_df["year"] = sales_df["sold_at"].dt.year
 
-        trends = {
-            "top_products": sales_df.groupby("dynamic_product_id")["quantity"].sum().nlargest(5).to_dict(),
-            "top_stores": {store_id: sales_df["quantity"].sum()} if store_id else {},
-            "monthly_trends": sales_df.groupby("month")["quantity"].sum().to_dict(),
-            "yearly_growth": sales_df.groupby("year")["quantity"].sum().pct_change().fillna(0).to_dict()
+        all_trends = {
+            "top_products": {},
+            "monthly_trends": {},
+            "monthly_growth": {}
         }
-        trends = convert_to_python_types(trends)
-        logger.debug(f"Generated trends for store_id {store_id or 'all'}: {trends}")
-        return trends
+        trend_records = []
+        for sid in store_ids:
+            sales_df = fetch_sales_data(sid)
+            if sales_df.empty:
+                logger.info(f"No sales data found for store_id {sid}")
+                continue
+            sales_df["sold_at"] = pd.to_datetime(sales_df["sold_at"], utc=True)
+            sales_df["month"] = sales_df["sold_at"].dt.to_period("M").astype(str)
+            sales_df["month_sort"] = sales_df["sold_at"].dt.to_period("M").dt.to_timestamp()
+
+            trends = {
+                "top_products": sales_df.groupby("dynamic_product_id")["quantity"].sum().nlargest(5).to_dict(),
+                "monthly_trends": sales_df.groupby("month")["quantity"].sum().to_dict(),
+                "monthly_growth": sales_df.groupby("month_sort")["quantity"].sum().pct_change().fillna(0).to_dict()
+            }
+            trends["monthly_growth"] = {k.strftime("%Y-%m"): v for k, v in trends["monthly_growth"].items()}
+            trends = convert_to_python_types(trends)
+
+            # Update all_trends for return
+            all_trends["top_products"].update(trends["top_products"])
+            all_trends["monthly_trends"].update(trends["monthly_trends"])
+            all_trends["monthly_growth"].update(trends["monthly_growth"])
+
+            # Prepare records for insertion
+            for month, quantity in trends["monthly_trends"].items():
+                record = {
+                    "store_id": int(sid),
+                    "month": month,
+                    "total_quantity": int(quantity),
+                    "monthly_growth": float(trends["monthly_growth"].get(month, 0)),
+                    "top_products": json.dumps(trends["top_products"]),
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
+                trend_records.append(record)
+
+        if trend_records:
+            try:
+                logger.info(f"Inserting {len(trend_records)} sales trends into Supabase: {trend_records}")
+                supabase.table("sales_trends").insert(trend_records).execute()
+            except Exception as e:
+                logger.error(f"Failed to insert trend records: {str(e)}\n{traceback.format_exc()}")
+        else:
+            logger.warning(f"No trend records generated for store_id {store_id or 'all'}; check data sufficiency")
+        logger.debug(f"Generated trends for store_id {store_id or 'all'}: {all_trends}")
+        return all_trends
     except Exception as e:
         logger.error(f"Error in sales_trends: {str(e)}\n{traceback.format_exc()}")
         raise
+
+# Scheduler function to run forecast and sales trends weekly
+def run_scheduled_tasks():
+    try:
+        logger.info("Starting scheduled tasks: forecast and sales trends")
+        # Run forecast_demand for all stores
+        forecasts = forecast_demand()
+        logger.info(f"Scheduled forecast completed: {len(forecasts)} forecasts generated")
+        # Run sales_trends for all stores
+        trends = sales_trends()
+        logger.info(f"Scheduled sales trends completed: {len(trends['monthly_trends'])} monthly trends inserted")
+    except Exception as e:
+        logger.error(f"Error in scheduled tasks: {str(e)}\n{traceback.format_exc()}")
+
+# Set up BackgroundScheduler
+scheduler = BackgroundScheduler(timezone="UTC")
+scheduler.add_job(run_scheduled_tasks, 'interval', weeks=1, next_run_time=datetime.now(timezone.utc))
+scheduler.start()
+logger.info("BackgroundScheduler started for weekly forecast and sales trends")
+
+# Shutdown scheduler gracefully
+atexit.register(lambda: scheduler.shutdown())
 
 # Inquiry processing
 def process_inquiry(inquiry_text):
@@ -352,16 +462,25 @@ def forecast_endpoint():
                 return jsonify({"error": "Invalid store_id format"}), 400
 
         forecasts = forecast_demand(store_id)
-        # anomalies = detect_anomalies(store_id)  # Temporarily disabled
         theft_incidents = detect_theft(store_id)
-        trends = sales_trends(store_id)
+        trends_query = supabase.table("sales_trends").select("month, total_quantity, monthly_growth, top_products").order("created_at", desc=True).limit(100)
+        if store_id:
+            trends_query = trends_query.eq("store_id", store_id)
+        else:
+            trends_query = trends_query.in_("store_id", fetch_store_ids())
+        trends = trends_query.execute().data
+        trends_response = {
+            "top_products": trends[0]["top_products"] if trends else {},
+            "monthly_trends": {t["month"]: t["total_quantity"] for t in trends},
+            "monthly_growth": {t["month"]: t["monthly_growth"] for t in trends}
+        }
         response = {
             "forecasts": forecasts,
             "anomalies": [],  # Return empty list
             "theft_incidents": theft_incidents,
-            "trends": trends
+            "trends": trends_response
         }
-        logger.debug(f"Forecast endpoint response: {response}")
+        logger.debug(f"Forecast endpoint response: {len(forecasts)} forecasts, {len(theft_incidents)} theft incidents, {len(trends)} trends")
         return jsonify(response), 200
     except Exception as e:
         logger.error(f"Error in /forecast: {str(e)}\n{traceback.format_exc()}")
