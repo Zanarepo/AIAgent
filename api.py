@@ -217,7 +217,7 @@ def detect_theft(store_id=None):
         logger.error(f"Error in detect_theft: {str(e)}\n{traceback.format_exc()}")
         raise
 
-# Anomaly detection
+# Anomaly detection (kept for reference, not called in forecast_endpoint)
 def detect_anomalies(store_id=None):
     try:
         sales_df = fetch_sales_data(store_id)
@@ -353,12 +353,12 @@ def forecast_endpoint():
                 return jsonify({"error": "Invalid store_id format"}), 400
 
         forecasts = forecast_demand(store_id)
-        anomalies = detect_anomalies(store_id)
+        # anomalies = detect_anomalies(store_id)  # Temporarily disabled
         theft_incidents = detect_theft(store_id)
         trends = sales_trends(store_id)
         response = {
             "forecasts": forecasts,
-            "anomalies": anomalies,
+            "anomalies": [],  # Return empty list
             "theft_incidents": theft_incidents,
             "trends": trends
         }
